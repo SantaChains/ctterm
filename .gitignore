@@ -1,0 +1,34 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 生成的数据产物（管线输出：terms / translations / flagged / 审计导出）
+data/*
+!data/build_glossary_qualified.py
+
+# 运行时输出（导出表 / AI 译文 / 检查点 / 用户字典 / 合并词表）
+terms*
+translations*
+user_terms.tsv
+combine*.json
+dict.txt
+glossary_qualified.tsv
+idlist-3.0-dlc*
+
+# 外部素材与产物（CT 表、ID 列表 xlsx、Excel 工作簿一律不入库）
+*.ct
+*.CT
+*.xlsx
+
+# 运行时状态与备份（含 API Key 的本地配置绝不入库；example 是模板，必须入库）
+gui_config.json
+*.bak
+*.bak.*
+*.tmp
+*.log
+
+# GUI 心跳 / 临时脚本产物
+_*.txt
+_*.py
+!_gui_launch.pyw

@@ -1,0 +1,9 @@
+{
+ "ai_model": "deepseek-chat",
+ "ai_api_key": "",
+ "ai_base_url": "https://api.deepseek.com",
+ "last_ct2": "",
+ "last_ct": "",
+ "dict_path": "",
+ "geometry": "1280x800"
+}
