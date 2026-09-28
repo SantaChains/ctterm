@@ -178,7 +178,8 @@ def run_merge_cmd(base: str, delta: str, out: str) -> dict:
 def run_ai_translate(xlsx: str, out: str | None, api_key: str | None,
                      base_url: str, model: str, batch_size: int,
                      user_terms: str | None, dry_run: bool,
-                     glossary: bool = False, conflicts: bool = False) -> dict:
+                     glossary: bool = False, conflicts: bool = False,
+                     max_workers: int = 5) -> dict:
     key = api_key or os.environ.get("DEEPSEEK_API_KEY", "")
     if not key and not dry_run:
         raise ValueError("缺少 API Key：设 DEEPSEEK_API_KEY 环境变量或加 --api-key")
@@ -190,7 +191,7 @@ def run_ai_translate(xlsx: str, out: str | None, api_key: str | None,
                      base_url=base_url or DEFAULT_BASE_URL,
                      model=model or DEFAULT_MODEL, batch_size=batch_size,
                      dry_run=dry_run, user_terms=user_terms,
-                     include_conflicts=conflicts)
+                     include_conflicts=conflicts, max_workers=max_workers)
 
 
 def run_add_note(ct: str, text: str, out: str | None) -> dict:
@@ -290,6 +291,8 @@ def build_parser():
                      help="OpenAI 兼容接口地址")
     pai.add_argument("--model", default=DEFAULT_MODEL)
     pai.add_argument("--batch-size", type=int, default=30)
+    pai.add_argument("--max-workers", type=int, default=5,
+                     help="并发批次数（API 吞吐主杠杆，1=串行；过大易被限流）")
     pai.add_argument("--dry-run", action="store_true",
                      help="离线演练：不调 API，用假译文走完整校验/回填链路")
     _add_glossary_opts(pai)

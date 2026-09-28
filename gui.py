@@ -3,12 +3,13 @@
 
 布局（顶部路径栏 + 主流程步骤条 / 左设置栏 + 中预览区 + 右功能页签 / 底部状态栏）：
   路径栏：选择 CT（路径 / 窗口几何 / 类型开关状态均记忆于 gui_config.json）
-  主流程：① 提取词条 → ② 导出 XLSX → ③ AI 翻译 → ④ 导入译文 ▾ → ⑤ 批量替换
+  主流程：① 提取词条 → ② 加载词典 ▾ → ③ 导出 XLSX → ④ AI 翻译 →
+          ⑤ 人工定夺 ▾（拦截词条审核/导出/导回）→ ⑥ 批量替换
           步骤按钮按前置完成情况自动启用/置灰，始终知道下一步点哪
   左设置栏：类型开关（2 列 × 4 行，状态记忆）、最小提取长度、TXT 预览导出、
             字典状态与另存
-  预览区：占满剩余高度，分批渲染（万级行不冻结），横向滚动
-  功能页签：对照（DIFF/COVER）| 工具（多行注意事项）| 设置（AI 连接参数）
+  预览区：占满剩余高度，分批渲染（万级行不冻结），含原文/译文对照列
+  功能页签：对照（DIFF/COVER，可清除所选即不 diff）| 工具 | 设置（AI 参数）
   状态栏：进度条 + 分阶段状态文字
 
 批量替换生成新 CT（源文件只读，绝不覆盖；.bak 备份在首次提取时生成）。
@@ -20,6 +21,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import queue
 import shutil
 import threading
 import time
@@ -86,12 +88,25 @@ class App:
         root.geometry(self.cfg.get("geometry", "1280x800"))
         root.minsize(1024, 640)
         self.terms: list[dict] = []          # 提取结果
-        self.model = None
         self.ct_path: str | None = None
         self.dict_map: dict[str, str] = {}   # 合并后的本地字典
         self.last_xlsx: str | None = None
+        self._review: "FlaggedReviewWindow | None" = None   # 打开的定夺窗口（退出前查未存译文）
+        self._pending_rows: list[dict] = []  # 预览渲染数据（与 tree 行序一致）
+        self._busy = False                   # 后台任务互斥：防连点产生并发竞争
+        self._ai_cancel = threading.Event()  # AI 翻译协作式取消（批次间检查）
+        self._ai_stop_mode = False           # ④ 按钮当前处于「停止翻译」态
+        # 跨线程 UI 回调唯一通道：工作线程绝不直接碰 Tk（root.after 在部分
+        # 环境抛 "main thread is not in main loop" 且静默丢回调），改由
+        # 主线程 30ms 轮询消费——AI 进度条曾因此全程不动（"没反应"的根因）
+        self._ui_queue: queue.Queue = queue.Queue()
 
         self._build_ui()
+        self._load_dict_file()   # 启动自动恢复上次字典（此前只存不载，重启即丢）
+        if self.dict_map:
+            self.lbl_dict.config(text=f"本地字典：{len(self.dict_map)} 条")
+            self._refresh_step_states()
+        self._poll_ui_queue()   # 启动跨线程 UI 回调轮询
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         last = self.cfg.get("last_ct")
         if last and Path(last).exists():
@@ -116,24 +131,33 @@ class App:
         steps = ttk.LabelFrame(self.root, text="主流程（按序执行）")
         steps.pack(fill="x", **pad)
         self.btn_extract = ttk.Button(steps, text="① 提取词条", command=self.do_extract)
-        self.btn_export = ttk.Button(steps, text="② 导出 XLSX",
+        self.btn_dict = ttk.Menubutton(steps, text="② 加载词典 ▾")
+        menu_dict = tk.Menu(self.btn_dict, tearoff=0)
+        menu_dict.add_command(label="导入 TSV 字典（EN→ZH 两列）", command=self.do_import_tsv)
+        menu_dict.add_command(label="导入 XLSX（8 列正典，含哈希校验）", command=self.do_import_xlsx)
+        menu_dict.add_command(label="导入 TXT（原文/译文交替行）", command=self.do_import_txt)
+        menu_dict.add_separator()
+        menu_dict.add_command(label="清除字典（无字典全翻译）", command=self.do_clear_dict)
+        self.btn_dict.config(menu=menu_dict)
+        self.btn_export = ttk.Button(steps, text="③ 导出 XLSX",
                                      command=self.do_export_xlsx, state="disabled")
-        self.btn_ai = ttk.Button(steps, text="③ AI 翻译",
-                                 command=self.do_ai_translate, state="disabled")
-        self.btn_import = ttk.Menubutton(steps, text="④ 导入译文 ▾")
-        menu = tk.Menu(self.btn_import, tearoff=0)
-        menu.add_command(label="导入 XLSX（正典 8 列，含哈希校验）", command=self.do_import_xlsx)
-        menu.add_command(label="导入 TXT（原文/译文交替行）", command=self.do_import_txt)
-        menu.add_command(label="导入 TSV 字典（EN→ZH 两列）", command=self.do_import_tsv)
-        menu.add_separator()
-        menu.add_command(label="清除字典（无字典全翻译）", command=self.do_clear_dict)
-        self.btn_import.config(menu=menu)
-        self.btn_apply = ttk.Button(steps, text="⑤ 批量替换 → 新文件",
+        self.btn_ai = ttk.Button(steps, text="④ AI 翻译",
+                                 command=self._on_ai_button, state="disabled")
+        self.btn_review = ttk.Menubutton(steps, text="⑤ 人工定夺 ▾", state="disabled")
+        menu_rev = tk.Menu(self.btn_review, tearoff=0)
+        menu_rev.add_command(label="打开定夺窗口（逐条审核 / 采纳 AI 建议）",
+                             command=self.do_open_review)
+        menu_rev.add_command(label="导出拦截词条 XLSX（供人工翻译）",
+                             command=self.do_export_flagged_xlsx)
+        menu_rev.add_command(label="导入人工翻译 XLSX（导回）", command=self.do_import_xlsx)
+        self.btn_review.config(menu=menu_rev)
+        self.btn_apply = ttk.Button(steps, text="⑥ 批量替换 → 新文件",
                                     command=self.do_apply, state="disabled")
-        for i, b in enumerate((self.btn_extract, self.btn_export, self.btn_ai,
-                               self.btn_import, self.btn_apply)):
+        for i, b in enumerate((self.btn_extract, self.btn_dict, self.btn_export,
+                               self.btn_ai, self.btn_review, self.btn_apply)):
             b.pack(side="left", fill="x", expand=True, padx=(6 if i == 0 else 3, 3))
-        ttk.Label(steps, text="字典在「导出 XLSX」之前导入即自动预填（用户字典优先于内置词表）",
+        ttk.Label(steps, text="流程：提取 → 加载词典 → 导出（词典自动预填）→ AI 翻译 → "
+                              "人工定夺拦截词条 → 替换输出；词典在 ③ 之前加载即自动预填",
                   foreground="#888").pack(anchor="w", padx=8, pady=(0, 2))
 
         # ---- 主区：左设置栏 | 中预览 | 右功能页签 ----
@@ -175,16 +199,16 @@ class App:
             side="left", padx=2)
         ttk.Button(row_ds, text="清除字典", command=self.do_clear_dict).pack(
             side="left", padx=2)
-        ttk.Label(lf_dict, text="导入走主流程 ④；导入/修改后自动保存到\n上次使用的字典文件（默认 dict.txt）",
+        ttk.Label(lf_dict, text="导入走主流程 ②；导入/修改后自动保存到\n上次使用的字典文件（默认 dict.txt）",
                   foreground="#888", justify="left").pack(anchor="w", padx=6, pady=(0, 2))
 
-        # 中：预览（占满剩余高度）
-        prev = ttk.LabelFrame(main, text="预览（原文 / 类型 / 出现次数 / 长度 / 上下文）")
+        # 中：预览（占满剩余高度，原文/译文对照）
+        prev = ttk.LabelFrame(main, text="预览（原文 / 译文 / 类型 / 出现次数 / 长度 / 上下文）")
         main.add(prev, weight=1)
-        cols = ("src", "type", "line", "len", "ctx")
+        cols = ("src", "dst", "type", "line", "len", "ctx")
         self.tree = ttk.Treeview(prev, columns=cols, show="headings")
-        for c, (w, t) in zip(cols, [(360, "原文"), (110, "类型"), (70, "出现次数"),
-                                    (50, "长度"), (240, "上下文")]):
+        for c, (w, t) in zip(cols, [(330, "原文"), (230, "译文"), (105, "类型"),
+                                    (60, "出现次数"), (45, "长度"), (200, "上下文")]):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor="w")
         vsb = ttk.Scrollbar(prev, orient="vertical", command=self.tree.yview)
@@ -208,6 +232,7 @@ class App:
         ttk.Entry(row_ct2, textvariable=self.var_ct2).pack(
             side="left", fill="x", expand=True)
         ttk.Button(row_ct2, text="选文件…", command=self.pick_ct2).pack(side="left", padx=2)
+        ttk.Button(row_ct2, text="清除", command=self.do_clear_ct2).pack(side="left", padx=2)
         row_cmp = ttk.Frame(tab_cmp)
         row_cmp.pack(fill="x", padx=6, pady=4)
         ttk.Button(row_cmp, text="DIFF 两 CT", command=self.do_diff).pack(
@@ -247,6 +272,14 @@ class App:
             value=self.cfg.get("ai_base_url", "https://api.deepseek.com"))
         ttk.Entry(row_ai2, textvariable=self.var_baseurl).pack(
             side="left", fill="x", expand=True, padx=4)
+        row_ai3 = ttk.Frame(lf_ai)
+        row_ai3.pack(fill="x", padx=6, pady=2)
+        ttk.Label(row_ai3, text="并发批次:").pack(side="left")
+        self.var_maxworkers = tk.IntVar(value=self.cfg.get("ai_max_workers", 5))
+        ttk.Spinbox(row_ai3, from_=1, to=16, width=4,
+                    textvariable=self.var_maxworkers).pack(side="left", padx=4)
+        ttk.Label(row_ai3, text="（同时请求的批次数，提速主杠杆；过大易被接口限流）",
+                  foreground="#888").pack(side="left")
         ttk.Label(lf_ai, text="校验不合格的行自动留白并写 flagged 报告，绝不带病替换；\n"
                              "Key 明文保存在本机 gui_config.json，仅本机使用。",
                   foreground="#888", justify="left").pack(anchor="w", padx=6, pady=(0, 2))
@@ -263,6 +296,16 @@ class App:
 
     # ------------------------------------------------------------------
     def _on_close(self):
+        rw = self._review
+        if (rw is not None and rw.dst and rw.win.winfo_exists()
+                and not messagebox.askyesno(
+                    "退出", "定夺窗口存在尚未「存入字典」的人工译文，退出将丢弃。\n确定退出？")):
+            return
+        if self._busy and not messagebox.askyesno(
+                "退出", "后台任务仍在执行，直接退出将中断本次运行。\n"
+                        "（AI 翻译有断点保护，已完成的批次不会丢失，下次可续跑）\n\n"
+                        "确定退出？"):
+            return
         self.cfg["geometry"] = self.root.geometry()
         _save_cfg(self.cfg)
         self.root.destroy()
@@ -271,12 +314,27 @@ class App:
         self.cfg["types"] = {k: bool(v.get()) for k, v in self.type_vars.items()}
         _save_cfg(self.cfg)
 
+    def _set_steps_state(self, state: str):
+        for b in (self.btn_extract, self.btn_dict, self.btn_export,
+                  self.btn_ai, self.btn_review, self.btn_apply):
+            b.config(state=state)
+
     def _refresh_step_states(self):
-        """主流程步骤按前置完成情况启停：②③需已提取，③另需已导出 XLSX，⑤需字典非空。"""
+        """主流程步骤按前置完成情况启停：③需已提取，④另需已导出 XLSX，
+        ⑤需存在拦截词条文件（④ 完成后生成），⑥需字典非空。
+        忙态（后台任务执行中）下六步全部锁定，杜绝并发竞争。"""
+        if self._busy:
+            self._set_steps_state("disabled")
+            return
+        self.btn_extract.config(state="normal")
+        self.btn_dict.config(state="normal")
         has_terms = bool(self.terms)
         self.btn_export.config(state="normal" if has_terms else "disabled")
         self.btn_ai.config(
             state="normal" if (has_terms and self.last_xlsx) else "disabled")
+        fp = self._flagged_path()
+        self.btn_review.config(
+            state="normal" if (self.last_xlsx and fp and fp.exists()) else "disabled")
         self.btn_apply.config(
             state="normal" if (has_terms and self.dict_map) else "disabled")
 
@@ -292,10 +350,24 @@ class App:
     def _selected_types(self) -> set[str]:
         return {k for k, v in self.type_vars.items() if v.get()}
 
-    def _run_bg(self, fn, done):
-        """后台线程执行，完成后主线程回调；进度条脉冲。"""
-        self.progress.start(12)
-        self.var_status.set("处理中…")
+    def _run_bg(self, fn, done, guard=True):
+        """后台线程执行，完成后经队列通道回主线程回调。
+
+        guard=True（默认）：主流程写操作（提取/导出/AI/替换/字典导入）——
+        全程锁定六步并占用状态栏进度条。重复点击会派生并发任务，竞争同一份
+        checkpoint / xlsx / 字典快照（如两个 AI 翻译同跑互相覆盖进度）。
+        guard=False：旁路只读/独立输出操作（DIFF/COVER/导出 TXT/加注/拦截
+        导出/对照表导出）——不锁步骤、不动全局进度条与状态栏（避免覆盖
+        AI 实时进度），与进行中的主流程任务并行安全。返回 True=已启动。
+        """
+        if guard and self._busy:
+            messagebox.showinfo("提示", "有任务正在后台执行，请等它完成或先停止。")
+            return False
+        if guard:
+            self._busy = True
+            self._refresh_step_states()   # 忙态 → 六步全锁定
+            self.progress.start(12)
+            self.var_status.set("处理中…")
 
         def worker():
             try:
@@ -303,17 +375,53 @@ class App:
                 err = None
             except Exception as e:      # noqa: BLE001
                 result, err = None, e
-            self.root.after(0, lambda: self._done(done, result, err))
-        threading.Thread(target=worker, daemon=True).start()
+            self._ui_queue.put(lambda: self._done(done, result, err, guard))
 
-    def _done(self, done, result, err):
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _poll_ui_queue(self):
+        """主线程轮询消费工作线程的 UI 回调（30ms，空转开销可忽略）。"""
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except tk.TclError:
+                pass   # 回调目标窗口已销毁（如定夺窗口先关、导入后到）——正常竞态
+            except Exception:   # noqa: BLE001
+                import traceback
+                traceback.print_exc()   # 单个回调失败绝不终止轮询（否则全部后续回调丢失）
+        self.root.after(30, self._poll_ui_queue)
+
+    def _done(self, done, result, err, guard=True):
+        """统一出口。guard=True 时复位全局互斥态；先跑 done（可能派生新任务
+        或更新 self.terms 等流程状态），再按最新状态刷新步骤启停——
+        顺序反了会导致「提取完成后 ③ 仍置灰」这类状态滞留。"""
+        if not guard:
+            if err:
+                messagebox.showerror("错误", str(err))
+                return
+            done(result)
+            return
         self.progress.stop()
         self._ai_running = False   # 复位 AI 翻译心跳（无论成败）
+        self._ai_stop_mode = False
+        self._ai_cancel.clear()
+        self.btn_ai.config(text="④ AI 翻译")
+        self._busy = False
         if err:
             messagebox.showerror("错误", str(err))
             self.var_status.set(f"失败：{err}")
+            self._refresh_step_states()
             return
-        done(result)
+        try:
+            done(result)
+        finally:
+            if not self._busy:   # done 未派生新任务 → 按最新状态恢复启停
+                self._refresh_step_states()
 
     # ------------------------------------------------------------------
     def _show_rows(self, rows, final_status: str):
@@ -329,14 +437,32 @@ class App:
         rows = self._pending_rows
         for r in rows[self._row_pos: self._row_pos + PREVIEW_BATCH]:
             self.tree.insert("", "end", values=(
-                r["src"][:120], r["type"], f"×{r['count']}",
-                len(r["src"]), r["ctx"][:80]))
+                r["src"][:120], self.dict_map.get(r["src"], ""), r["type"],
+                f"×{r['count']}", len(r["src"]), r["ctx"][:80]))
         self._row_pos += PREVIEW_BATCH
         if self._row_pos < len(rows):
             self.var_status.set(f"预览加载中… {self._row_pos}/{len(rows)}")
             self.root.after(1, self._render_batch)
         else:
             self.var_status.set(self._final_status)
+
+    def _fill_dst_column(self):
+        """字典变化后回填预览「译文」列（分批刷新，万级行不卡顿）。"""
+        rows = self._pending_rows
+        items = self.tree.get_children()
+        if not rows or len(items) != len(rows):
+            return   # 预览尚未渲染完或数据已换，渲染时会按当前字典填入
+        dm = self.dict_map
+        pos = 0
+
+        def step():
+            nonlocal pos
+            for it in items[pos: pos + PREVIEW_BATCH]:
+                self.tree.set(it, "dst", dm.get(rows[pos]["src"], ""))
+                pos += 1
+            if pos < len(items):
+                self.root.after(1, step)
+        step()
 
     def do_extract(self):
         ct = self.var_ct.get().strip()
@@ -362,10 +488,10 @@ class App:
                     continue
                 if len(t["source"].strip()) < minlen:
                     continue
-            out.append({"src": t["source"], "type": "+".join(t["type"]),
-                        "count": t["count"], "cls": t["class"],
-                        "ctxs": t.get("contexts", []),
-                        "ctx": " > ".join(t.get("contexts", [])[:2])})
+                out.append({"src": t["source"], "type": "+".join(t["type"]),
+                            "count": t["count"], "cls": t["class"],
+                            "ctxs": t.get("contexts", []),
+                            "ctx": " > ".join(t.get("contexts", [])[:2])})
             return ct, out, dict(res["stats"])
 
         def done(res):
@@ -441,48 +567,64 @@ class App:
             return
         model = self.var_model.get().strip() or "deepseek-chat"
         base_url = self.var_baseurl.get().strip() or "https://api.deepseek.com"
+        try:
+            max_workers = max(1, min(16, int(self.var_maxworkers.get())))
+        except (tk.TclError, ValueError):
+            max_workers = 5
         # 记住填写的连接信息（Key 明文存本机 gui_config.json，仅本机使用）
-        self.cfg.update(ai_api_key=api_key, ai_model=model, ai_base_url=base_url)
+        self.cfg.update(ai_api_key=api_key, ai_model=model, ai_base_url=base_url,
+                        ai_max_workers=max_workers)
         _save_cfg(self.cfg)
         xlsx_in = self.last_xlsx
         out_json = Path(xlsx_in).with_name(Path(xlsx_in).stem + "-ai.json")
 
-        # 进度可见性：进度条按条数推进 + 秒级心跳（首批返回前界面上不能是死的）
-        self._ai_running = True
-        t0 = time.time()
-
+        # 进度可见性：进度条按条数推进 + 秒级心跳（首批返回前界面上不能是死的）。
+        # _ai_running/tick 必须在 _run_bg 成功后才启动——忙态被拒时若已启动，
+        # 心跳会永远空转并不断覆盖状态栏文字
         def tick():
             if not self._ai_running:
                 return
             self.var_status.set(
-                f"AI 翻译中… 已提交模型，等待批次返回（已等待 {int(time.time() - t0)} 秒；"
+                f"AI 翻译中… 已提交模型，等待批次返回（已等待 {int(time.time() - self._ai_t0)} 秒；"
                 f"单批 30 条，接口超时上限 5 分钟，首批返回后每批更新进度条）")
             self.root.after(1000, tick)
 
         def work():
-            from eldenct.aitrans import translate, read_pending
-            total = len(read_pending(xlsx_in))
+            from eldenct.aitrans import translate   # 待译总数由 translate 内部读取，勿重复解析整表
 
-            def init_ui():
-                self.progress.stop()   # 关闭 _run_bg 的自动步进，改为真实条数
-                self.progress.configure(maximum=max(total, 1), value=0)
-            self.root.after(0, init_ui)
+            self._ui_queue.put(lambda: (
+                self.progress.stop(),   # 关闭 _run_bg 的自动步进，改为真实条数
+                self.progress.configure(value=0)))
 
             def progress(done_n, total_n):
                 def upd():
                     pct = done_n * 100 // max(total_n, 1)
                     self.var_status.set(f"AI 翻译中… {done_n}/{total_n} 条（{pct}%）")
                     self.progress.configure(value=done_n, maximum=max(total_n, 1))
-                self.root.after(0, upd)
+                self._ui_queue.put(upd)   # 工作线程 → 主线程唯一安全通道
             return translate(xlsx_in, out_json,
                              Path(xlsx_in).with_name(Path(xlsx_in).stem + "-ai.xlsx"),
                              api_key=api_key, base_url=base_url, model=model,
-                             progress_cb=progress)
+                             max_workers=max_workers,
+                             progress_cb=progress,
+                             should_cancel=self._ai_cancel.is_set)
 
         def done(r):
+            if r.get("cancelled"):
+                # 取消不丢进度：合格批次已入 checkpoint + xlsx 副本，重跑续传
+                self.var_status.set(
+                    f"AI 翻译已停止：本轮合格 {r['translated']} 条已保留，"
+                    f"剩余 {r['pending'] - r['translated'] - r['done_before']} 条待续"
+                    f"（重新点 ④ 从断点续跑）")
+                messagebox.showinfo(
+                    "已停止",
+                    f"已停止 AI 翻译。\n\n本轮合格 {r['translated']} 条已填入副本，"
+                    f"断点已保存。\n重新点「④ AI 翻译」将从断点续跑，不重复计费。")
+                return
             self.var_status.set(
                 f"AI 翻译完成：{r['translated']}/{r['pending']} 条，"
                 f"校验拦截 {r['flagged']} 条（详见 {Path(r['out_json']).with_suffix('.flagged.json').name}）")
+            self._refresh_step_states()   # flagged 文件已落盘，⑤ 人工定夺解锁
             gl = f"\n术语表：{r['glossary_out']}" if r.get("glossary_out") else ""
             if messagebox.askyesno(
                     "AI 翻译完成",
@@ -491,9 +633,30 @@ class App:
                     f"拦截 {r['flagged']} 条（留白待人工）{gl}\n\n"
                     f"是否立即导入该副本作为译文来源？"):
                 self._import_ai_result(r["xlsx_out"])
+            elif r["flagged"]:
+                if messagebox.askyesno("人工定夺",
+                                       f"有 {r['flagged']} 条被拦截的词条需要人工定夺，"
+                                       "是否立即打开定夺窗口？"):
+                    self.do_open_review()
 
-        self.root.after(0, tick)
-        self._run_bg(work, done)
+        self._ai_cancel.clear()   # 清掉上一次的取消信号（先清后跑）
+        if self._run_bg(work, done):
+            # 六步已锁定；单独复活 ④ 为「停止翻译」——长任务必须随时可停
+            self._ai_running = True
+            self._ai_t0 = time.time()
+            self.root.after(0, tick)
+            self._ai_stop_mode = True
+            self.btn_ai.config(state="normal", text="④ 停止翻译")
+
+    def _on_ai_button(self):
+        """④ 双态按钮：平时发起新翻译；翻译中点击 = 协作式取消。"""
+        if self._ai_stop_mode:
+            self._ai_cancel.set()
+            self.btn_ai.config(state="disabled", text="④ 正在停止…")
+            self.var_status.set(
+                "AI 翻译：已请求停止，等待在途批次返回…（已完成批次全部保留，可续跑）")
+            return
+        self.do_ai_translate()
 
     def _import_ai_result(self, xlsx_path):
         def work():
@@ -522,7 +685,8 @@ class App:
                 "\n".join(r["src"] for r in self.terms), encoding="utf-8")
             return out
 
-        self._run_bg(work, lambda o: messagebox.showinfo("完成", f"已导出：{o}"))
+        self._run_bg(work, lambda o: messagebox.showinfo("完成", f"已导出：{o}"),
+                     guard=False)   # 独立输出文件，与主流程并行安全
 
     # ------------------------------------------------------------------
     def do_import_xlsx(self):
@@ -599,17 +763,56 @@ class App:
                             "· 批量替换仅使用之后导入的译文"):
             return
         self.dict_map.clear()
+        self._save_dict()   # 空字典立即落盘：否则重启自动加载把清空悄悄撤销
         self.lbl_dict.config(text="本地字典：0 条（无字典模式）")
         self._refresh_step_states()
+        self._fill_dst_column()   # 预览「译文」列同步清空
         messagebox.showinfo("已清除", "字典已清空：无字典全翻译模式")
+
+    def _load_dict_file(self):
+        """启动时自动加载上次的字典文件（EN;ZH 每行一条，split 首个分号）。
+
+        此前字典只保存不加载：重启后 dict_map 恒为空，用户需重新导入——
+        现与 _save_dict 形成闭环，GUI 字典跨会话持久。
+        """
+        p = self.cfg.get("dict_path") or str(PROJ / "dict.txt")
+        if not Path(p).exists():
+            return
+        try:
+            d: dict[str, str] = {}
+            for line in Path(p).read_text(encoding="utf-8").splitlines():
+                if ";" in line:
+                    k, v = line.split(";", 1)
+                    if k and v.strip():
+                        d[k] = v
+            self.dict_map = d
+        except OSError:
+            pass   # 加载失败不阻断启动（可手动经 ② 重新导入）
+
+    def _write_dict_file(self, p: str) -> int:
+        """字典写盘（EN;ZH 每行一条）。返回因格式不兼容被跳过的条数。
+
+        键是替换匹配的精确依据，含 ';' / 换行的键无法以单行 EN;ZH 无损表达
+        （改写会造成重载后键错配），只能跳过（内存中仍有效，本次会话可用）；
+        值仅显示/写入用，换行降级为空格无损语义。
+        """
+        def _flat(s: str) -> str:
+            return s.replace("\r", " ").replace("\n", " ")
+
+        lines, skipped = [], 0
+        for k, v in self.dict_map.items():
+            if ";" in k or "\n" in k or "\r" in k:
+                skipped += 1
+                continue
+            lines.append(f"{k};{_flat(v)}")
+        Path(p).write_text("\n".join(lines), encoding="utf-8")
+        return skipped
 
     def _save_dict(self):
         """静默持久化到上次使用的字典文件（默认 dict.txt），不打断导入流程。"""
         p = self.cfg.get("dict_path") or str(PROJ / "dict.txt")
         try:
-            Path(p).write_text(
-                "\n".join(f"{k};{v}" for k, v in self.dict_map.items()),
-                encoding="utf-8")
+            self._write_dict_file(p)
             self.cfg["dict_path"] = p
             _save_cfg(self.cfg)
         except OSError:
@@ -625,17 +828,23 @@ class App:
             filetypes=[("字典 TXT", "*.txt")])
         if not p:
             return
-        Path(p).write_text(
-            "\n".join(f"{k};{v}" for k, v in self.dict_map.items()),
-            encoding="utf-8")
+        try:
+            skipped = self._write_dict_file(p)
+        except OSError as e:
+            messagebox.showerror("错误", f"字典保存失败：{e}")
+            return
         self.cfg["dict_path"] = p
         _save_cfg(self.cfg)
-        messagebox.showinfo("完成", f"已保存 {len(self.dict_map)} 条 → {p}")
+        extra = f"（{skipped} 条因含分号/换行无法以 EN;ZH 格式保存，已跳过）" if skipped else ""
+        messagebox.showinfo("完成", f"已保存 {len(self.dict_map) - skipped} 条 → {p}{extra}")
 
-    def _dict_done(self, n, n_issue=0):
+    def _dict_done(self, n, n_issue=0, quiet=False):
         self.lbl_dict.config(text=f"本地字典：{len(self.dict_map)} 条")
         self._refresh_step_states()
+        self._fill_dst_column()   # 预览「译文」列实时对照
         self._save_dict()   # 主线程执行：写盘不允许出现在后台线程
+        if quiet:   # 静默模式：定夺窗口关闭等场景不打断操作流
+            return
         extra = f"，忽略 {n_issue} 条异常行" if n_issue else ""
         messagebox.showinfo("完成", f"合并 {n} 条{extra}，字典共 {len(self.dict_map)} 条"
                                     f"（已自动保存到 {self.cfg.get('dict_path', 'dict.txt')}）")
@@ -679,7 +888,7 @@ class App:
                        rows=rows, stats=stats, kind="diff",
                        export_initial=f"{Path(a).stem}-diff-{Path(b).stem}.txt")
 
-        self._run_bg(work, done)
+        self._run_bg(work, done, guard=False)   # 只读对照，可与 AI 翻译并行
 
     def do_cover(self):
         paths = self._cmp_paths()
@@ -704,7 +913,7 @@ class App:
                        unknown=unknown,
                        export_initial=f"{Path(a).stem}-cover.txt")
 
-        self._run_bg(work, done)
+        self._run_bg(work, done, guard=False)   # 只读对照，可与 AI 翻译并行
 
     def _ask_multiline(self, title: str, label: str) -> str | None:
         """多行文本输入对话框（simpledialog.askstring 只有单行，满足不了多行需求）。
@@ -752,10 +961,109 @@ class App:
             return add_note_entry(ct, text.strip(), out)
 
         def done(res):
-            self.var_status.set(f"注意事项已追加：ID {res['id']} → {Path(res['out']).name}")
-            messagebox.showinfo("完成", self.var_status.get())
+            messagebox.showinfo(
+                "完成", f"注意事项已追加：ID {res['id']} → {Path(res['out']).name}")
 
-        self._run_bg(work, done)
+        self._run_bg(work, done, guard=False)   # 独立输出 -note.CT，不碰共享状态
+
+    # ------------------------------------------------------------------
+    # ⑤ 人工定夺：拦截词条审核 / 导出 / 导回
+    # ------------------------------------------------------------------
+    def _flagged_path(self) -> Path | None:
+        """当前 XLSX 对应的 AI 拦截词条文件（terms-ai.flagged.json）。"""
+        if not self.last_xlsx:
+            return None
+        return Path(self.last_xlsx).with_name(
+            Path(self.last_xlsx).stem + "-ai.flagged.json")
+
+    def do_open_review(self):
+        fp = self._flagged_path()
+        if not fp or not fp.exists():
+            messagebox.showwarning(
+                "提示", "未找到拦截词条文件（*-ai.flagged.json）。\n请先执行 ④ AI 翻译。")
+            return
+        self._review = FlaggedReviewWindow(self.root, self, fp)
+
+    def do_export_flagged_xlsx(self):
+        """拦截词条导出为正典 8 列 XLSX：AI 建议与拦截原因写入备注列（参考不填入）。"""
+        fp = self._flagged_path()
+        if not fp or not fp.exists():
+            messagebox.showwarning("提示", "未找到拦截词条文件，请先执行 ④ AI 翻译。")
+            return
+        out = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=Path(self.last_xlsx).stem + "-flagged.xlsx",
+            filetypes=[("Excel", "*.xlsx")])
+        if not out:
+            return
+        type_map = {r["src"]: r["type"].split("+") for r in self.terms}   # 主线程快照
+        ctx_map = {r["src"]: r["ctxs"] for r in self.terms if r["ctxs"]}
+
+        def work():
+            from eldenct.xlsxio import export_terms_xlsx
+            flagged = json.loads(fp.read_text(encoding="utf-8"))
+            seen: set[str] = set()
+            terms, partial = [], {}
+            for f in flagged:
+                src = f.get("src", "")
+                if not src or src in seen:
+                    continue
+                seen.add(src)
+                terms.append({"source": src,
+                              "type": type_map.get(src, ["Description"]),
+                              "count": 1, "class": "normal",
+                              "contexts": [], "entries": []})
+                partial[src] = (f"AI建议：{f.get('zh') or '（无）'}"
+                                f"｜拦截原因：{f.get('reason', '?')}")
+            return export_terms_xlsx(terms, out, auto_translations={},
+                                     partial_notes=partial, contexts=ctx_map)
+
+        def done(info):
+            messagebox.showinfo(
+                "完成", f"拦截词条已导出：{out}\n主表 {info['rows']} 行（全部待人工翻译）\n"
+                        f"AI 建议与拦截原因在备注列，仅供参考、不自动填入。\n"
+                        f"翻译完成后用 ⑤「导入人工翻译 XLSX」导回。")
+
+        self._run_bg(work, done, guard=False)   # 独立输出 xlsx，并行安全
+
+    def _export_compare_xlsx(self, ct_out: str):
+        """替换完成后导出原文/译文对照表（词条 × 当前字典译文，空 = 未译）。"""
+        terms_snapshot = list(self.terms)
+        dict_snapshot = dict(self.dict_map)
+        out = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=Path(ct_out).stem + "-对照.xlsx",
+            filetypes=[("Excel", "*.xlsx")])
+        if not out:
+            return
+
+        def work():
+            import xlsxwriter
+            wb = xlsxwriter.Workbook(str(Path(out).resolve()))
+            ws = wb.add_worksheet("原文译文对照")
+            fmt = wb.add_format({"bold": True, "bg_color": "#D9E1F2"})
+            ws.write_row(0, 0, ["原文", "译文", "类型", "出现次数"], fmt)
+            for i, r in enumerate(terms_snapshot, start=1):
+                ws.write_string(i, 0, r["src"])
+                ws.write_string(i, 1, dict_snapshot.get(r["src"], ""))
+                ws.write_string(i, 2, r["type"])
+                ws.write_number(i, 3, r["count"])
+            for c, w in enumerate([60, 60, 16, 10]):
+                ws.set_column(c, c, w)
+            wb.close()
+            return len(terms_snapshot)
+
+        def done(n):
+            self.var_status.set(f"对照表已导出：{out}")
+            messagebox.showinfo("完成", f"对照表 {n} 行已导出：\n{out}")
+
+        self._run_bg(work, done, guard=False)   # 独立输出 xlsx，并行安全
+
+    def do_clear_ct2(self):
+        """清除对照文件选择（不 diff）。"""
+        self.var_ct2.set("")
+        self.cfg["last_ct2"] = ""
+        _save_cfg(self.cfg)
 
     # ------------------------------------------------------------------
     def do_apply(self):
@@ -783,7 +1091,10 @@ class App:
                 f"替换完成：desc {r['desc_applied']} / dd {r['dd_applied']} / "
                 f"lua {r['lua_applied']} / form {r['form_applied']}；"
                 f"missed {len(r['missed'])}；unknown {len(r['unknown_sources'])}")
-            messagebox.showinfo("完成", f"已生成：{out}\n\n{self.var_status.get()}")
+            if messagebox.askyesno(
+                    "完成", f"已生成：{out}\n\n{self.var_status.get()}\n\n"
+                            f"是否导出原文/译文对照表（XLSX）？"):
+                self._export_compare_xlsx(out)
 
         self._run_bg(work, done)
 
@@ -1014,7 +1325,8 @@ class DiffWindow:
         self.text_a.xview(*args)
         self.text_b.xview(*args)
 
-    def _sync_pair(self, src, dst, first):
+    def _sync_pair(self, dst, first):
+        """把 dst 栏的滚动位置对齐到 first（_syncing 防两栏互相触发死循环）。"""
         if self._syncing:
             return
         self._syncing = True
@@ -1026,11 +1338,11 @@ class DiffWindow:
 
     def _on_yscroll_a(self, first, last):
         self.vsb.set(first, last)
-        self._sync_pair(self.text_a, self.text_b, float(first))
+        self._sync_pair(self.text_b, float(first))
 
     def _on_yscroll_b(self, first, last):
         self.vsb.set(first, last)
-        self._sync_pair(self.text_b, self.text_a, float(first))
+        self._sync_pair(self.text_a, float(first))
 
     def _on_xscroll_a(self, first, last):
         self.hsb.set(first, last)
@@ -1113,6 +1425,206 @@ class DiffWindow:
         Path(out).write_text(fmt(), encoding="utf-8")
         self.lbl_count.config(text=f"已导出：{out}")
         os.startfile(out)
+
+
+# ==========================================================================
+# 人工定夺窗口：AI 拦截词条逐条审核 / 采纳建议 / 导出 XLSX / 导回
+# ==========================================================================
+class FlaggedReviewWindow:
+    """拦截词条（*-ai.flagged.json）人工定夺。
+
+    行数据：{"src", "reason", "zh"（AI 建议，可能缺失）}；同 src 去重。
+    人工译文暂存 self.dst{src: zh}，「存入字典并关闭」统一走
+    App._dict_done 合并 + 持久化 dict.txt + 预览译文列回填。
+    """
+
+    FILL_STEP = 500   # 分批渲染
+
+    def __init__(self, master, app: "App", flagged_path):
+        self.app = app
+        self.flagged_path = Path(flagged_path)
+        raw = json.loads(self.flagged_path.read_text(encoding="utf-8"))
+        seen: set[str] = set()
+        self.items: list[dict] = []
+        for f in raw:
+            if f.get("src") and f["src"] not in seen:
+                seen.add(f["src"])
+                self.items.append(f)
+        self.dst: dict[str, str] = {}
+        self._pos = 0
+        self._cur_src: str | None = None
+
+        win = tk.Toplevel(master)
+        win.title(f"人工定夺 — AI 拦截词条 {len(self.items)} 条（{self.flagged_path.name}）")
+        win.geometry("1150x680")
+        win.transient(master)
+        self.win = win
+
+        # ---- 工具条 ----
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=6, pady=4)
+        ttk.Button(bar, text="全部采纳 AI 建议", command=self._accept_all_ai).pack(
+            side="left", padx=2)
+        ttk.Button(bar, text="导出拦截 XLSX…", command=self.app.do_export_flagged_xlsx).pack(
+            side="left", padx=2)
+        ttk.Button(bar, text="从 XLSX 导回…", command=self._import_back).pack(
+            side="left", padx=2)
+        self.lbl_stat = ttk.Label(bar, text=self._stat_text(), foreground="#555")
+        self.lbl_stat.pack(side="left", padx=10)
+        ttk.Button(bar, text="存入字典并关闭", command=self._save_close).pack(
+            side="right", padx=2)
+
+        # ---- 列表 ----
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=6, pady=2)
+        cols = ("src", "ai", "reason", "dst")
+        self.tree = ttk.Treeview(body, columns=cols, show="headings")
+        for c, (w, t) in zip(cols, [(340, "原文"), (230, "AI 建议（校验不合格）"),
+                                    (150, "拦截原因"), (230, "人工译文")]):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor="w")
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        self.tree.tag_configure("done", foreground="#1E7B34")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        # ---- 编辑区 ----
+        ed = ttk.LabelFrame(win, text="编辑（选中行后填写；Enter 保存该条；留空 = 不译）")
+        ed.pack(fill="x", padx=6, pady=(2, 6))
+        self.lbl_src = ttk.Label(ed, text="（未选中）", wraplength=1050, justify="left")
+        self.lbl_src.pack(anchor="w", padx=8, pady=(4, 2))
+        row = ttk.Frame(ed)
+        row.pack(fill="x", padx=8, pady=(0, 6))
+        self.var_edit = tk.StringVar()
+        self.ent = ttk.Entry(row, textvariable=self.var_edit)
+        self.ent.pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="采纳 AI 建议", command=self._accept_ai_cur).pack(
+            side="left", padx=4)
+        ttk.Button(row, text="保存该条", command=self._save_one).pack(side="left")
+        self.ent.bind("<Return>", lambda e: self._save_one())
+
+        win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._fill_tree()
+
+    # ------------------------------------------------------------------
+    def _stat_text(self) -> str:
+        return f"已定夺 {len(self.dst)} / 共 {len(self.items)} 条"
+
+    def _row_values(self, idx: int) -> tuple:
+        f = self.items[idx]
+        zh = self.dst.get(f["src"], "")
+        return (f["src"], f.get("zh", ""), f.get("reason", ""), zh)
+
+    def _fill_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        self._pos = 0
+        self._fill_step()
+
+    def _fill_step(self):
+        for idx in range(self._pos, min(self._pos + self.FILL_STEP, len(self.items))):
+            f = self.items[idx]
+            zh = self.dst.get(f["src"], "")
+            self.tree.insert("", "end", iid=str(idx), values=(
+                f["src"], f.get("zh", ""), f.get("reason", ""), zh),
+                tags=("done",) if zh else ())
+        self._pos = min(self._pos + self.FILL_STEP, len(self.items))
+        if self._pos < len(self.items):
+            self.win.after(1, self._fill_step)
+
+    def _refresh_rows(self):
+        for idx in range(len(self.items)):
+            zh = self.dst.get(self.items[idx]["src"], "")
+            self.tree.item(str(idx), values=self._row_values(idx),
+                           tags=("done",) if zh else ())
+        self.lbl_stat.config(text=self._stat_text())
+
+    def _on_select(self, *_):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        f = self.items[int(sel[0])]
+        self._cur_src = f["src"]
+        self.lbl_src.config(text=f["src"])
+        self.var_edit.set(self.dst.get(f["src"], f.get("zh", "") or ""))
+        self.ent.focus_set()
+
+    def _save_one(self):
+        if self._cur_src is None:
+            return
+        v = self.var_edit.get().strip()
+        if v:
+            self.dst[self._cur_src] = v
+        else:
+            self.dst.pop(self._cur_src, None)
+        for idx, f in enumerate(self.items):
+            if f["src"] == self._cur_src:
+                zh = self.dst.get(f["src"], "")
+                self.tree.item(str(idx), values=self._row_values(idx),
+                               tags=("done",) if zh else ())
+                break
+        self.lbl_stat.config(text=self._stat_text())
+
+    def _accept_ai_cur(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        f = self.items[int(sel[0])]
+        if not f.get("zh"):
+            messagebox.showinfo("提示", "该条没有 AI 建议（API 未返回）。", parent=self.win)
+            return
+        self.var_edit.set(f["zh"])
+        self._save_one()
+
+    def _accept_all_ai(self):
+        for idx, f in enumerate(self.items):
+            if f.get("zh"):
+                self.dst[f["src"]] = f["zh"]
+                self.tree.item(str(idx), values=self._row_values(idx), tags=("done",))
+        self.lbl_stat.config(text=self._stat_text())   # 状态栏实时可见，不打断
+
+    def _import_back(self):
+        p = filedialog.askopenfilename(parent=self.win,
+                                       filetypes=[("Excel", "*.xlsx")])
+        if not p:
+            return
+        known = {f["src"] for f in self.items}
+
+        def work():
+            from eldenct.xlsxio import import_translations_xlsx
+            translations, issues, _e = import_translations_xlsx(p)
+            return translations, len(issues)
+
+        def done(res):
+            translations, n_issue = res
+            hit = {k: v for k, v in translations.items() if k in known}
+            self.dst.update(hit)
+            self._refresh_rows()
+            extra = f"，忽略 {n_issue} 条异常行" if n_issue else ""
+            messagebox.showinfo(
+                "完成", f"导入 {len(translations)} 条，命中拦截词条 {len(hit)} 条{extra}",
+                parent=self.win)
+
+        self.app._run_bg(work, done, guard=False)   # 只改本窗口暂存区，并行安全
+
+    def _save_close(self):
+        if not self.dst:
+            if messagebox.askyesno("关闭", "未填写任何译文，确定直接关闭？", parent=self.win):
+                self.win.destroy()
+            return
+        self.app.dict_map.update(self.dst)
+        self.app._dict_done(len(self.dst), quiet=True)   # 静默合并：不打断关闭动作
+        self.win.destroy()
+
+    def _on_close(self):
+        if self.dst and not messagebox.askyesno(
+                "关闭", "存在尚未「存入字典」的人工译文，关闭将丢弃。\n确定关闭？",
+                parent=self.win):
+            return
+        self.win.destroy()
 
 
 if __name__ == "__main__":

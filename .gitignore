@@ -13,6 +13,7 @@ translations*
 user_terms.tsv
 combine*.json
 dict.txt
+dict/
 glossary_qualified.tsv
 idlist-3.0-dlc*
 

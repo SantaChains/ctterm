@@ -232,12 +232,15 @@ def translate(xlsx_path: str | Path, out_json: str | Path, xlsx_out: str | Path,
               temperature: float = 0.2, dry_run: bool = False,
               user_terms: str | Path | None = None,
               include_conflicts: bool = False, max_workers: int = 5,
-              progress_cb=None) -> dict:
+              progress_cb=None, should_cancel=None) -> dict:
     """主入口：提取待译行 → 上下文补全 → 并发分批翻译 → 校验 → 填回 + 导出术语表。
 
     max_workers: 并发批次数（API 吞吐的主要杠杆；dry-run 恒为串行）。
+    should_cancel: 协作式取消探针（无参 callable，每完成一批检查一次）。
+        取消语义：已完成批次照常入 checkpoint（重跑自动续传，零浪费）；
+        尚未开始的批次直接取消不调 API；已在途批次等自然返回后丢弃结果。
     返回 {pending, done_before, translated, flagged, batches, ctx_filled,
-          glossary_out, out_json, xlsx_out}。
+          glossary_out, out_json, xlsx_out, cancelled}。
     """
     from .glossary import Glossary
     from .matcher import LongestMatcher
@@ -326,23 +329,47 @@ def translate(xlsx_path: str | Path, out_json: str | Path, xlsx_out: str | Path,
         if progress_cb:
             progress_cb(len(done), len(pending))
 
+    cancelled = False
     if dry_run or max_workers <= 1:
         for chunk in chunks:
             settle(*run_batch(chunk))
+            if should_cancel and should_cancel():
+                cancelled = True
+                break
     else:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        ex = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futs = [ex.submit(run_batch, c) for c in chunks]
             for fut in as_completed(futs):
                 settle(*fut.result())
+                if should_cancel and should_cancel():
+                    cancelled = True
+                    break
+        finally:
+            if cancelled:
+                # 排队未启动的批次直接撤单（不浪费 API）；在途批次自然跑完，
+                # 结果不并入 done——行保持待译，下次续跑重做
+                ex.shutdown(wait=False, cancel_futures=True)
+            else:
+                ex.shutdown(wait=True)
 
     # 合格译文填回 xlsx 副本（绝不覆盖原表），备注标注来源
     _fill_xlsx(xlsx_path, xlsx_out, done)
-    Path(out_json).write_text(
-        json.dumps(done, ensure_ascii=False, indent=1), encoding="utf-8")
+    # out_json 也走原子写：与 checkpoint 同一哲学（截断 JSON 会毁掉下游合并链路）
+    out_json_p = Path(out_json)
+    _tmp = out_json_p.with_suffix(".json.tmp")
+    _tmp.write_text(json.dumps(done, ensure_ascii=False, indent=1), encoding="utf-8")
+    _tmp.replace(out_json_p)
+    # 拦截报告反映"最近一轮"的结果：本轮有拦截则覆盖；本轮零拦截且正常跑完
+    # 则删掉上一轮遗留文件——否则 ⑤ 定夺窗口会拿过期条目让人重复审已译内容
+    # （取消时在途批次的拦截记录被丢弃、对应行仍在待译，保留旧文件反而更接近真相）
+    flagged_path = Path(out_json).with_suffix(".flagged.json")
     if flagged:
-        Path(out_json).with_suffix(".flagged.json").write_text(
+        flagged_path.write_text(
             json.dumps(flagged, ensure_ascii=False, indent=1), encoding="utf-8")
+    elif not cancelled and flagged_path.exists():
+        flagged_path.unlink()
     # 原文→译文导出用户术语表（人工校对后可直接 --user-terms 复用）；
     # dry-run 的 mock 译文不落术语表，防污染
     glossary_out = ""
@@ -353,7 +380,8 @@ def translate(xlsx_path: str | Path, out_json: str | Path, xlsx_out: str | Path,
             "translated": len(done) - done_before, "flagged": len(flagged),
             "batches": batches, "ctx_filled": ctx_filled,
             "glossary_out": glossary_out,
-            "out_json": str(out_json), "xlsx_out": str(xlsx_out)}
+            "out_json": str(out_json), "xlsx_out": str(xlsx_out),
+            "cancelled": cancelled}
 
 
 def _export_glossary_tsv(path: str | Path, translations: dict[str, str]):

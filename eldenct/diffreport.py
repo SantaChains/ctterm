@@ -112,10 +112,10 @@ def diff_same_ct(ct_path: str | Path, translations: dict[str, str]):
     known = set(occ_text.values())
     # 与 apply 同口径：模板键（'Huw +{0}'）先展开为具体键再统计覆盖，
     # 否则模板行全被误报为 unknown_sources
-    from .replace import _expand_templates
+    from .replace import _TPL_PH, _expand_templates
     lookup, tpl_expanded, _tpl_issues, tpl_used = _expand_templates(
         dict(translations), known)
-    unknown = [k for k in translations if k not in known and "{0}" not in k]
+    unknown = [k for k in translations if k not in known and _TPL_PH not in k]
     applied = 0
     rows = []
     for key, text in sorted(occ_text.items(), key=lambda kv: (kv[0][0], kv[0][1])):
@@ -134,7 +134,7 @@ def diff_same_ct(ct_path: str | Path, translations: dict[str, str]):
             rows.append((eid, field, text, "", "unchanged"))
     total = sum(occ_count.values())
     tpl_unmatched = [k for k in translations
-                     if "{0}" in k and k not in tpl_used]
+                     if _TPL_PH in k and k not in tpl_used]
     return rows, {"translated": applied, "unchanged": total - applied,
                   "unknown_sources": len(unknown),
                   "template_expanded": tpl_expanded,
