@@ -12,7 +12,8 @@ xlsx 是给人看的（8 列 + 样式 + 预填混杂），直接丢给 AI 有三
 ------------------------------------------------
 1. read_pending : 从 terms.xlsx 主表提取待译行（normal 且译文为空）
 2. translate    : 分批调 API + checkpoint 断点续跑（崩溃不丢进度）
-3. validate     : 严格校验（{0} 数量 / 数字保真 / 术语未译 / 空译），
+3. validate     : 严格校验（{0} 数量 / 数字保真（NFKC 口径）/ 术语未译
+                  （词边界）/ 译名锁定（CJK 二字语素相似度）/ 空译），
                   不合格行一律留白并写 flagged 报告——宁缺勿错
 4. fill_xlsx    : 合格译文填回 xlsx 副本（备注标"AI 译文（待校对）"），
                   之后照常 导入 → apply
@@ -25,6 +26,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -112,7 +114,9 @@ def read_pending(xlsx_path: str | Path) -> list[dict]:
         pending.append({
             "src": src,
             "ph": src.count("{0}"),
-            "digits": sorted(_DIG_RUN.findall(src)),
+            # NFKC 后取数字：源串可能自带全角数字（０〜180），与译文
+            # NFKC 归一后的口径保持一致，否则恒假阳性
+            "digits": sorted(_DIG_RUN.findall(unicodedata.normalize("NFKC", src))),
             "ref": suggestion_from_note(note),
             "ctx": ctx,
         })
@@ -170,6 +174,12 @@ def _enrich_context(pending: list[dict]) -> int:
 
 
 # ----------------------------------------------------------------------
+def _cjk_bigrams(s: str) -> set[str]:
+    """CJK 相邻二字语素集（用于译名相似度判定，见 _validate）。"""
+    return {s[i:i + 2] for i in range(len(s) - 1)
+            if "\u4e00" <= s[i] <= "\u9fff" and "\u4e00" <= s[i + 1] <= "\u9fff"}
+
+
 def _validate(row: dict, zh: str, row_terms: dict[str, str]) -> str | None:
     """返回 None = 通过；否则返回拒绝原因。宁缺勿错。"""
     if not zh or not zh.strip():
@@ -179,13 +189,29 @@ def _validate(row: dict, zh: str, row_terms: dict[str, str]) -> str | None:
         return "译文与原文相同"
     if zh.count("{0}") != row["ph"]:
         return f"占位符数不符（需 {row['ph']}）"
-    if sorted(_DIG_RUN.findall(zh)) != row["digits"]:
-        return f"数字不保真（源 {row['digits']} vs 译 {sorted(_DIG_RUN.findall(zh))}）"
+    # 全角数字/符号是排版差异（写盘由 replace._clean 归一为半角），
+    # 校验前先 NFKC 归一，否则 '众武护符＋１' 被误判为「数字不保真」。
+    zh_norm = unicodedata.normalize("NFKC", zh)
+    if sorted(_DIG_RUN.findall(zh_norm)) != row["digits"]:
+        return (f"数字不保真（源 {row['digits']} vs "
+                f"译 {sorted(_DIG_RUN.findall(zh_norm))}）")
     for en, locked in row_terms.items():
         # 恒等锁定（HP→HP、FP→FP 等要求保留原样的术语）不判残留，
         # 否则 "HP 消耗" 这类正确译文必被假阳性拦截
-        if en in zh and en != locked:
+        if en == locked:
+            continue
+        # 词边界匹配：'value' 不得从 'valueType' 中切出（子串假阳性）
+        if re.search(rf"(?<![A-Za-z]){re.escape(en)}(?![A-Za-z])", zh_norm):
             return f"术语未译：{en!r} 残留"
+        # R1 实义校验（降噪版）：锁定值不在译文中、且与译文连一个共同
+        # CJK 二字语素都没有时才拦——完全离谱才拦（Arcane→奥术），
+        # 合法重组放行（'龙飨大教堂' 保共享语素 '龙飨'；官方名常省略
+        # '仪式' 等尾缀）。逐字包含检查实测 893 假阳性 / 15294，不可用。
+        # locked 同步 NFKC：词表值含全角标点（（轻装））时与 zh_norm 对齐
+        locked_norm = unicodedata.normalize("NFKC", locked)
+        if locked_norm not in zh_norm and not (_cjk_bigrams(locked_norm)
+                                               & _cjk_bigrams(zh_norm)):
+            return f"术语疑似未按官方译名：{en}→{locked}"
     return None
 
 
