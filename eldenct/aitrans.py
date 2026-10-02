@@ -42,8 +42,37 @@ _SUGG_MARK = "词表建议参考："
 # 实测 1127 条「译文与原文相同」拦截中 1112 条属此类——纯烧 API，读取即跳过。
 _HAS_CJK_SRC = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\uff66-\uff9f]")
 
+# CE 脚本内部行：汇编 / hex 转储 / 注释 / 内存地址 / 纯缩写标记——
+# 不是英文文本，送 AI 只有两种下场：原样返回（烧 API 纯浪费）或
+# 误译后通过校验污染脚本标签。高精度正则、读取即跳过（宁左勿滥：
+# 拿不准的仍送 AI，由 flagged 人工定夺兜底）。汇编分支的寄存器
+# 操作数取白名单——'call of the wild' 这类真实游戏文本不得误杀。
+_CE_CODE = re.compile(
+    r"^(?:"
+    r"\s*[;#]"                                          # AA 脚本注释
+    r"|(?:db|dq|dd|dw)\s+[0-9A-Fa-f]{1,2}(?:\s+[0-9A-Fa-f]{2})*\s*$"  # hex 转储
+    r"|\"[^\"]+\"\+[0-9A-Fa-f]+"                        # "eldenring.exe"+3C80158
+    r"|\"[A-Z0-9_]{1,8}\"$"                             # "WTF" 等引号缩写
+    r"|\[\s*[A-Za-z0-9_]{1,6}\s*\]$"                    # [Havok] / [ NPC ] 标签
+    r"|[A-Z0-9_]{1,6}$"                                 # ID/NPC/DLC/CX 等缩写
+    r"|[a-z]{1,3}$"                                     # x/hks/裸助记符 等短标识符
+    r"|(?:mov|jmp|push|pop|call|ret|cmp|test|add|sub|xor|inc|dec|nop|lea)$"  # 裸助记符
+    r"|(?:mov|movss|movsd|movaps|movups|movzx|movsx|lea|jmp|push|pop|call|ret"
+    r"|cmp|test|add|sub|and|xor|inc|dec|neg|not|mul|imul|div|idiv|shl|shr|sar"
+    r"|xchg|cdq|cwde|nop|fld|fstp|fild|fmul|fadd|fsub|fnstcw|fldcw|cvtsi2ss"
+    r"|cvtss2si|ucomiss|comiss|setne|sete|setg|setl|setge|setle"
+    r")\s+(?:\[[^\]]+\]"
+    r"|[re]?(?:ax|bx|cx|dx|si|di|sp|bp)|eip|r\d{1,2}[bwd]?"
+    r"|xmm\d+|ymm\d+|al|ah|bl|bh|cl|ch|dl|dh|sil|dil|bpl|spl|st\(\d\)"
+    r"|(?:[qd]?word|byte)(?:\s+ptr)?|ptr)"
+    r")"
+)
+
 # 官方属性/状态译名（最高优先级，压过词表里的异值如 Arcane→奥术）。
 # 来源：艾尔登法环官方简中。用户术语表（--user-terms）仍可再覆盖。
+# Critical/MP/stamina/Estus 为审计补录：暴击是 MMO 腔（官方=致命一击）；
+# MP 数据层内部值取精力值同构的「法力值」；小写 stamina 词表残留黑魂
+# 「耐力」；Estus 是黑魂称谓，法环表内一律圣杯瓶。
 OFFICIAL_STATS = {
     "Vigor": "生命力",
     "Mind": "集中力",
@@ -55,7 +84,11 @@ OFFICIAL_STATS = {
     "Arcane": "感应",
     "HP": "HP",
     "FP": "FP",
+    "MP": "法力值",
     "Stamina": "精力值",
+    "stamina": "精力值",
+    "Critical": "致命一击",
+    "Estus": "圣杯瓶",
 }
 
 _SYSTEM_PROMPT = """[ROLE] FromSoftware 官方术语库锁定的 CT（Cheat Engine 修改表）翻译引擎。
@@ -109,6 +142,9 @@ def read_pending(xlsx_path: str | Path) -> list[dict]:
             continue
         # 带中文的源串不译（增量口径）：zh 基底已汉化的混排词条原样保留
         if _HAS_CJK_SRC.search(src):
+            continue
+        # CE 脚本内部行不送 AI：见 _CE_CODE 注释
+        if _CE_CODE.search(src):
             continue
         seen.add(src)
         pending.append({
