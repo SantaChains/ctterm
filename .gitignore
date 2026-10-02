@@ -26,10 +26,13 @@ idlist-3.0-dlc*
 gui_config.json
 *.bak
 *.bak.*
+*.baak
 *.tmp
 *.log
 
-# GUI 心跳 / 临时脚本产物
+# GUI 心跳 / 临时脚本产物（下划线前缀；包内 __init__/__main__ 是正式源码，必须入库）
 _*.txt
 _*.py
 !_gui_launch.pyw
+!eldenct/__init__.py
+!eldenct/__main__.py

@@ -33,8 +33,10 @@ _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent   # eldenct/ → 仓�
 DEFAULT_WORD_ROOT = Path(
     os.environ.get("ELDENCT_WORD_ROOT") or (_PROJ_ROOT / "eldenring"))
 
-# 全角 ASCII 区（U+FF01-U+FF5E）：全角字母/数字/标点是词表污染信号
-_FULLWIDTH_ASCII = re.compile(r"[\uFF01-\uFF5E]")
+# 全角字母（Ａ-Ｚ ａ-ｚ）：词表污染信号（如 `Dont`→`Ｄont`）。
+# 全角数字（＋１）与全角标点（（）？！：）不算污染：前者由 replace._clean
+# 在写盘时归一为半角（对齐 zh.CT 风格 ＋３→+3），后者是标准中文排版。
+_FULLWIDTH_ASCII = re.compile(r"[\uFF21-\uFF3A\uFF41-\uFF5A]")
 
 
 def is_usable_zh(dst: str) -> bool:
@@ -42,8 +44,9 @@ def is_usable_zh(dst: str) -> bool:
 
     自动生成的译文（xlsx 预填 / 备注建议 / fallback 替换）必须：
     1. 含中文字符（翻译的语义 = 输出中文）；
-    2. 不含全角 ASCII（combine 词表存在 `Dont`→`Ｄont` 这类
-       全角污染条目，会让自动替换产出不可读文本）。
+    2. 不含全角字母（combine 词表存在 `Dont`→`Ｄont` 这类全角污染
+       条目）。全角数字（＋１）由 replace._clean 写盘时归一为半角，
+       全角标点是标准中文排版，二者均不在拒绝之列。
     不满足则视为词表退化条目，自动路径一律不采用。
     """
     return (any("\u4e00" <= c <= "\u9fff" for c in dst)

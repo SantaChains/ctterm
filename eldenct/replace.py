@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import unicodedata
 from pathlib import Path
 
 from lxml import etree
@@ -46,6 +47,16 @@ _XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 # 译文中的换行/回车会破坏单行结构（Description 假设单行，写入 \n 会把
 # 一行物理拆成多行、行号整体错位），必须剔除
 _NEWLINE_RE = re.compile(r"[\r\n]")
+
+# 全角字母/数字/＋－ → 半角（对齐 zh.CT 既有风格：＋３→+3、【１】→[1]）。
+# 仅归一全角 ASCII 中的字母数字与加减号；全角标点（（）！？：）是标准
+# 中文排版，原样保留。
+_FW_ALNUM = str.maketrans({
+    **{chr(0xFF10 + i): str(i) for i in range(10)},
+    **{chr(0xFF21 + i): chr(ord("A") + i) for i in range(26)},
+    **{chr(0xFF41 + i): chr(ord("a") + i) for i in range(26)},
+    "\uFF0B": "+", "\uFF0D": "-",
+})
 
 
 def _escape_xml(text: str) -> str:
@@ -98,7 +109,8 @@ def _clean(text: str) -> str:
     """
     if _DOUBLE_ESCAPE_RE.search(text):
         text = _unescape_xml(text)
-    return _NEWLINE_RE.sub("", _XML_ILLEGAL_RE.sub("", text))
+    text = _XML_ILLEGAL_RE.sub("", text)
+    return _NEWLINE_RE.sub("", text.translate(_FW_ALNUM))
 
 
 def _replace_description_line(line: str, old_text: str, new_text: str):
@@ -153,12 +165,27 @@ def _atomic_write(out_path: Path, content: str):
 _DIG_RUN = re.compile(r"\d+")
 _TPL_PH = "{0}"
 
+# 归一化回退匹配（查找专用，绝不回写源文本）：
+# NFKC 全半角折叠 + 弯引号统一 + 空白坍缩 + 大小写折叠
+_NORM_QUOTE_RE = re.compile(r"[’‘＇｀]")
+_WS_RUN_RE = re.compile(r"\s+")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _norm_key(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s)
+    s = _NORM_QUOTE_RE.sub("'", s)
+    s = _WS_RUN_RE.sub(" ", s)
+    return s.strip().casefold()
+
 
 def _expand_templates(lookup: dict[str, str], known: set[str]):
     """把模板键展开为具体键。返回 (展开后 lookup, 展开成功数, 问题列表, 已用模板键集)。
 
     精确键优先：文本已有译文则不展开。占位符数与数字跑数不符的译文
     判为问题并跳过（宁可漏替换，绝不产出丢失数字的错译）。
+    used 语义：展开生效 + 被精确键完全覆盖（covered）的模板键合集——
+    后者从未展开但并非"未匹配"，混入 unmatched 报告会造成误报。
     """
     tpl = {k: v for k, v in lookup.items() if _TPL_PH in k}
     if not tpl:
@@ -167,23 +194,29 @@ def _expand_templates(lookup: dict[str, str], known: set[str]):
     expanded = dict(lookup)
     n = 0
     used: set[str] = set()
+    covered: set[str] = set()
     issues: list[str] = []
     for text in known:
-        if text in expanded or _TPL_PH in text or not _DIG_RUN.search(text):
+        if _TPL_PH in text or not _DIG_RUN.search(text):
             continue
         tkey = make_template(text)
         v = tpl.get(tkey)
         if v is None:
             continue
+        if text in expanded:
+            covered.add(tkey)   # 精确键已覆盖，模板无需生效
+            continue
         dst = fill_template(v, _DIG_RUN.findall(text))
         if dst is None:
             issues.append(f"模板占位符数不符: {v[:40]!r} (需 {_DIG_RUN.findall(text)}) 对 {text[:40]!r}")
             continue
-        if dst != text:
-            expanded[text] = dst
-            used.add(tkey)
-            n += 1
-    return expanded, n, issues, used
+        if dst == text or not is_usable_zh(dst):
+            covered.add(tkey)   # 展开结果与原文相同（恒等）或译文不可用，视为覆盖
+            continue
+        expanded[text] = dst
+        used.add(tkey)
+        n += 1
+    return expanded, n, issues, used | covered
 
 
 def strict_parser():
@@ -254,9 +287,49 @@ def apply_translations(ct_path: str | Path, translations: dict[str, str],
                       if s not in exported and s not in lookup
                       and is_usable_zh(d))
 
+    # 译文可用性过滤（直译路径此前无守卫）：值≠键且不含中文 = 脏条目，
+    # 如 'Frayed Blade'→'frayed blade' 这类反向键会把英文写回 CT。
+    # v == k 为刻意恒等锁定（HP→HP，防 AI 改写），保留——天然 no-op。
+    dirty_values: list[str] = []
+    _filtered = {}
+    for k, v in lookup.items():
+        if v == k or is_usable_zh(v):
+            _filtered[k] = v
+        else:
+            dirty_values.append(k)
+    lookup = _filtered
+
     # 数字模板展开（'Huw +{0}' → '+1'/'+2'/… 具体键）：
     # 精确键优先，展开只补空白；对全部四层（Desc/DD/Lua/Form）统一生效
     lookup, tpl_expanded, tpl_issues, tpl_used = _expand_templates(lookup, known)
+
+    # 归一化回退匹配（优先级：精确 > 模板 > 归一）：大小写/全半角/引号/空白
+    # 变体共享同一译文。歧义键（多源键归一后同形且译文不同）整组排除——
+    # 宁缺勿滥；已含中文的源文本不参与（防 zh→zh 二次改写）。
+    norm_index: dict[str, str] = {}
+    norm_ambiguous: set[str] = set()
+    for k, v in lookup.items():
+        if _TPL_PH in k:
+            continue
+        nk = _norm_key(k)
+        if not nk:
+            continue
+        if nk in norm_index:
+            if norm_index[nk] != v:
+                norm_ambiguous.add(nk)
+        else:
+            norm_index[nk] = v
+    norm_applied = 0
+    for text in known:
+        if text in lookup or _TPL_PH in text or _CJK_RE.search(text):
+            continue
+        nk = _norm_key(text)
+        if not nk or nk in norm_ambiguous:
+            continue
+        v = norm_index.get(nk)
+        if v and v != text:
+            lookup[text] = v
+            norm_applied += 1
 
     desc_applied = dd_applied = lua_applied = 0
     missed: list[str] = []
@@ -347,6 +420,11 @@ def apply_translations(ct_path: str | Path, translations: dict[str, str],
         "form_applied": form_applied,
         "template_expanded": tpl_expanded,
         "template_issues": tpl_issues[:10],
+        # 归一化回退命中数（大小写/全半角/引号/空白变体，歧义键已排除）
+        "norm_applied": norm_applied,
+        # 脏译文拒用数（值≠键且无中文，如 'X'→'x' 反向键会回写英文）
+        "dirty_count": len(dirty_values),
+        "dirty_values": dirty_values[:10],
         "missed": missed,
         # unknown 排除模板键：模板键是合法的合并形态，其未命中的情况
         # 由 templates_unmatched 单独报告（CT 改版 / 占位符数不符）
